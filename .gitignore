@@ -1,0 +1,9 @@
+# Compiled objects
+*.o
+
+# Executables
+raytracer
+check_offsets
+
+# Qt generated files
+*.moc
