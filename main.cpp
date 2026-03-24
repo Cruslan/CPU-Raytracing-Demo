@@ -6,6 +6,7 @@
 #include <QElapsedTimer>
 #include <QKeyEvent>
 #include <QMouseEvent>
+#include <QFocusEvent>
 #include <QCursor>
 #include <QDebug>
 #include <cmath>
@@ -91,6 +92,15 @@ protected:
 
         m_ignoreMouse = true;
         QCursor::setPos(mapToGlobal(m_lastMousePos));
+    }
+
+    void focusOutEvent(QFocusEvent *event) override {
+        m_keys.clear();
+        if (m_isDragging) {
+            m_isDragging = false;
+            unsetCursor();
+        }
+        QWidget::focusOutEvent(event);
     }
 
     void paintEvent(QPaintEvent *event) override {
