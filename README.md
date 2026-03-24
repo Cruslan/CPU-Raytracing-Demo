@@ -4,6 +4,7 @@ A real-time, interactive software raytracer built to demonstrate high-performanc
 
 ## Features
 
+- **Multi-Core Parallel Rendering:** High-speed frame generation utilizing all available CPU cores via C++ `std::thread` parallelization.
 - **ASM Rendering Core:** Ray-sphere and ray-plane intersections calculated using raw x86-64 NASM and SSE vectorization.
 - **Real-Time Freecam:** Fly around the scene in real-time using a delta-time smoothed camera.
 - **Reflective Materials:** Recursive ray bouncing to simulate perfect metallic reflections.
@@ -47,6 +48,6 @@ Start the application by running:
 
 The project bridges the gap between low-level assembly and high-level C++ using the **System V AMD64 ABI**. 
 
-- `main.cpp`: Manages the Qt6 `QMainWindow`, handles keyboard/mouse events, maintains the camera state (position, yaw, pitch), and allocates a 32-bit ARGB pixel buffer.
-- `raytracer.asm`: Exposes a `render_frame` function callable from C++. It takes the pixel buffer pointer, screen dimensions, and a pointer to the `SceneData` struct. It loops over every pixel, casts rays into the mathematical scene, computes bounces, and writes the final 8-bit color values back to the C++ buffer.
+- `main.cpp`: Manages the Qt6 `QMainWindow`, handles keyboard/mouse events, maintains the camera state (position, yaw, pitch), and allocates a 32-bit ARGB pixel buffer. It divides the screen into equal horizontal chunks and spawns worker threads based on the host CPU's hardware concurrency (`std::thread::hardware_concurrency()`).
+- `raytracer.asm`: Exposes a `render_frame_part` function callable from C++. It takes the pixel buffer pointer, screen dimensions, a range of rows to render (`y_start` and `y_end`), and a pointer to the `SceneData` struct. It computes the ray-scene intersections using SSE and writes the final 8-bit color values back to the C++ buffer.
 - `raytracer.h`: Defines the 16-byte aligned `SceneData`, `Vector3`, and `Sphere` structures shared between C++ and Assembly to ensure perfect memory layout matching.

@@ -24,15 +24,17 @@ struct alignas(16) SceneData {
     float plane_distance;    // 496 - 499
     int32_t has_plane;       // 500 - 503
     int32_t num_spheres;     // 504 - 507
-    float padding[2];        // 508 - 515
-    Vector3 camera_pos;      // 516 - 531
-    Vector3 camera_forward;  // 532 - 547
-    Vector3 camera_right;    // 548 - 563
-    Vector3 camera_up;       // 564 - 579
-    Vector3 light_pos;       // 580 - 595
+    float padding[5];        // 508 - 527 (to align camera_pos to 16 bytes)
+    Vector3 camera_pos;      // 528 - 543
+    Vector3 camera_forward;  // 544 - 559
+    Vector3 camera_right;    // 560 - 575
+    Vector3 camera_up;       // 576 - 591
+    Vector3 light_pos;       // 592 - 607
 };
 
-// Main ASM rendering function
+// Main ASM rendering function for a specific row range (inclusive start, exclusive end)
+void render_frame_part(uint32_t* pixels, int width, int height, int y_start, int y_end, const SceneData* scene);
+// Full ASM rendering function (calls render_frame_part internally or maintains legacy signature)
 void render_frame(uint32_t* pixels, int width, int height, const SceneData* scene);
 
 #ifdef __cplusplus

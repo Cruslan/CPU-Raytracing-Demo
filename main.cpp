@@ -12,6 +12,7 @@
 #include <cmath>
 #include <vector>
 #include <set>
+#include <thread>
 #include "raytracer.h"
 
 // Basic Vector utilities
@@ -114,7 +115,22 @@ protected:
         if (dt > 0.1f) dt = 0.1f;
 
         updateCamera(dt);
-        render_frame((uint32_t*)image.bits(), image.width(), image.height(), &scene);
+        
+        // Multi-threaded rendering
+        unsigned int numThreads = std::thread::hardware_concurrency();
+        if (numThreads == 0) numThreads = 4;
+        std::vector<std::thread> threads;
+        int rowsPerThread = image.height() / numThreads;
+        
+        for (unsigned int i = 0; i < numThreads; ++i) {
+            int yStart = i * rowsPerThread;
+            int yEnd = (i == numThreads - 1) ? image.height() : (i + 1) * rowsPerThread;
+            threads.emplace_back(render_frame_part, (uint32_t*)image.bits(), image.width(), image.height(), yStart, yEnd, &scene);
+        }
+        
+        for (auto& thread : threads) {
+            thread.join();
+        }
 
         QPainter painter(this);
         painter.drawImage(0, 0, image);

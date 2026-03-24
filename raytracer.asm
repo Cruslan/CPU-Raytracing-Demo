@@ -1,8 +1,23 @@
 section .text
     global render_frame
+    global render_frame_part
 
 ; void render_frame(uint32_t* pixels, int width, int height, const SceneData* scene)
 render_frame:
+    push rbp
+    mov rbp, rsp
+    ; Call render_frame_part(pixels, width, height, 0, height, scene)
+    ; RDI, RSI, RDX are already set
+    ; RCX is currently scene, move to R9
+    mov r9, rcx
+    xor rcx, rcx ; y_start = 0
+    mov r8, rdx ; y_end = height
+    call render_frame_part
+    pop rbp
+    ret
+
+; void render_frame_part(uint32_t* pixels, int width, int height, int y_start, int y_end, const SceneData* scene)
+render_frame_part:
     push rbp
     mov rbp, rsp
     push rbx
@@ -10,13 +25,16 @@ render_frame:
     push r13
     push r14
     push r15
-    sub rsp, 32 ; Local vars: [rsp+0..11] origin, [rsp+12..23] dir, [rsp+24] bounce
+    sub rsp, 40 ; Local vars: [rsp+0..11] origin, [rsp+12..23] dir, [rsp+24] bounce, [rsp+32] y_end
 
     ; Save arguments
     mov r12, rdi ; pixels
     mov r13, rsi ; width
     mov r14, rdx ; height
-    mov r15, rcx ; scene
+    ; rcx is y_start, use it directly as y
+    ; r8 is y_end
+    mov [rsp + 32], r8
+    mov r15, r9  ; scene
 
     ; Pre-calculate float constants
     cvtsi2ss xmm14, r13 ; width_f
@@ -26,9 +44,9 @@ render_frame:
     movaps xmm12, xmm14
     divss xmm12, xmm15
 
-    xor r8, r8 ; y = 0
+    mov r8, rcx ; y = y_start
 .loop_y:
-    cmp r8, r14
+    cmp r8, [rsp + 32]
     jge .done
 
     xor r9, r9 ; x = 0
@@ -407,7 +425,7 @@ render_frame:
     jmp .loop_y
 
 .done:
-    add rsp, 32
+    add rsp, 40
     pop r15
     pop r14
     pop r13
