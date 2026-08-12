@@ -10,7 +10,8 @@ main.moc: main.cpp raytracer.h
 	$(MOC) main.cpp -o main.moc
 
 raytracer: main.cpp raytracer.o main.moc
-	$(CXX) -fPIC -std=c++17 $(QT_CFLAGS) main.cpp raytracer.o -o raytracer $(QT_LIBS)
+	$(CXX) -O3 -march=native -ffast-math -fPIC -std=c++17 $(QT_CFLAGS) main.cpp raytracer.o -o raytracer $(QT_LIBS)
+
 
 raytracer.o: raytracer.asm
 	$(ASM) -f elf64 raytracer.asm -o raytracer.o

@@ -228,7 +228,110 @@ public:
 };
 
 int main(int argc, char *argv[]) {
+    bool benchmark = false;
+    int benchFrames = 200;
+    int benchSpheres = 1;
+    for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "--benchmark" || std::string(argv[i]) == "-b") {
+            benchmark = true;
+            if (i + 1 < argc && argv[i+1][0] != '-') {
+                benchFrames = std::atoi(argv[i+1]);
+            }
+        }
+        if (std::string(argv[i]) == "--spheres" || std::string(argv[i]) == "-s") {
+            if (i + 1 < argc && argv[i+1][0] != '-') {
+                benchSpheres = std::atoi(argv[i+1]);
+            }
+        }
+    }
+
     QApplication app(argc, argv);
+
+    if (benchmark) {
+        QImage image(800, 600, QImage::Format_ARGB32);
+        SceneData scene;
+        if (benchSpheres <= 1) {
+            scene.num_spheres = 1;
+            scene.spheres[0].center = {0.0f, 0.5f, -5.0f, 0.0f};
+            scene.spheres[0].radius = 1.0f;
+            scene.spheres[0].color = {1.0f, 0.0f, 0.0f, 0.0f};
+        } else {
+            scene.num_spheres = std::min(benchSpheres, 10);
+            scene.spheres[0].center = {0.0f, 0.5f, -5.0f, 0.0f};
+            scene.spheres[0].radius = 1.0f;
+            scene.spheres[0].color = {1.0f, 0.0f, 0.0f, 0.0f};
+            for (int s = 1; s < scene.num_spheres; ++s) {
+                float angle = s * (6.28318f / (scene.num_spheres - 1));
+                scene.spheres[s].center = {std::cos(angle)*3.0f, 0.5f, -5.0f + std::sin(angle)*3.0f, 0.0f};
+                scene.spheres[s].radius = 0.5f;
+                scene.spheres[s].color = {0.1f * s, 1.0f - 0.1f * s, 0.5f, 0.0f};
+            }
+        }
+        scene.plane_normal = {0.0f, 1.0f, 0.0f, 0.0f};
+        scene.plane_distance = 1.0f;
+        scene.has_plane = 1;
+        scene.light_pos = {2.0f, 2.0f, 0.0f, 0.0f};
+        scene.camera_pos = {0.0f, 0.0f, 0.0f, 0.0f};
+        scene.camera_forward = {0.0f, 0.0f, -1.0f, 0.0f};
+        scene.camera_right = {1.0f, 0.0f, 0.0f, 0.0f};
+        scene.camera_up = {0.0f, 1.0f, 0.0f, 0.0f};
+
+        unsigned int numThreads = std::thread::hardware_concurrency();
+        if (numThreads == 0) numThreads = 4;
+        int rowsPerThread = image.height() / numThreads;
+
+        // Warmup frame
+        {
+            std::vector<std::thread> threads;
+            for (unsigned int i = 0; i < numThreads; ++i) {
+                int yStart = i * rowsPerThread;
+                int yEnd = (i == numThreads - 1) ? image.height() : (i + 1) * rowsPerThread;
+                threads.emplace_back(render_frame_part, (uint32_t*)image.bits(), image.width(), image.height(), yStart, yEnd, &scene);
+            }
+            for (auto& t : threads) t.join();
+        }
+
+        QElapsedTimer timer;
+        timer.start();
+
+        for (int f = 0; f < benchFrames; ++f) {
+            std::vector<std::thread> threads;
+            for (unsigned int i = 0; i < numThreads; ++i) {
+                int yStart = i * rowsPerThread;
+                int yEnd = (i == numThreads - 1) ? image.height() : (i + 1) * rowsPerThread;
+                threads.emplace_back(render_frame_part, (uint32_t*)image.bits(), image.width(), image.height(), yStart, yEnd, &scene);
+            }
+            for (auto& t : threads) t.join();
+        }
+
+        qint64 elapsedMs = timer.elapsed();
+        double avgFps = (benchFrames * 1000.0) / elapsedMs;
+
+        // Compute checksum of rendered pixels
+        uint64_t checksum = 0;
+        const uint32_t* ptr = (const uint32_t*)image.bits();
+        size_t pixelCount = image.width() * image.height();
+        for (size_t i = 0; i < pixelCount; ++i) {
+            checksum = checksum * 31 + ptr[i];
+        }
+
+        qDebug() << "BENCHMARK_RESULTS: Frames:" << benchFrames << "Time(ms):" << elapsedMs << "FPS:" << avgFps << "Checksum:" << QString::number(checksum, 16);
+        FILE* f = fopen("rendered_frame.ppm", "wb");
+        if (f) {
+            fprintf(f, "P6\n800 600\n255\n");
+            const uint32_t* p = (const uint32_t*)image.bits();
+            for (int i = 0; i < 800 * 600; ++i) {
+                uint32_t c = p[i];
+                uint8_t r = (c >> 16) & 0xFF;
+                uint8_t g = (c >> 8) & 0xFF;
+                uint8_t b = c & 0xFF;
+                fputc(r, f); fputc(g, f); fputc(b, f);
+            }
+            fclose(f);
+        }
+        return 0;
+    }
+
     RaytracerWindow window;
     window.show();
     return app.exec();

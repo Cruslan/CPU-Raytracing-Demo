@@ -6,12 +6,9 @@ section .text
 render_frame:
     push rbp
     mov rbp, rsp
-    ; Call render_frame_part(pixels, width, height, 0, height, scene)
-    ; RDI, RSI, RDX are already set
-    ; RCX is currently scene, move to R9
     mov r9, rcx
     xor rcx, rcx ; y_start = 0
-    mov r8, rdx ; y_end = height
+    mov r8, rdx  ; y_end = height
     call render_frame_part
     pop rbp
     ret
@@ -25,15 +22,13 @@ render_frame_part:
     push r13
     push r14
     push r15
-    sub rsp, 40 ; Local vars: [rsp+0..11] origin, [rsp+12..23] dir, [rsp+24] bounce, [rsp+32] y_end
+    sub rsp, 312 ; 16-byte aligned stack frame
 
     ; Save arguments
     mov r12, rdi ; pixels
     mov r13, rsi ; width
     mov r14, rdx ; height
-    ; rcx is y_start, use it directly as y
-    ; r8 is y_end
-    mov [rsp + 32], r8
+    mov [rsp + 24], r8 ; y_end (64-bit)
     mov r15, r9  ; scene
 
     ; Pre-calculate float constants
@@ -41,294 +36,288 @@ render_frame_part:
     cvtsi2ss xmm15, r14 ; height_f
     
     ; aspect_ratio = width / height
-    movaps xmm12, xmm14
-    divss xmm12, xmm15
+    movups xmm12, xmm14
+    divss xmm12, xmm15 ; xmm12 = aspect_ratio
 
-    mov r8, rcx ; y = y_start
+    ; inv_width (xmm14) and inv_height (xmm15)
+    movss xmm0, [rel one]
+    divss xmm0, xmm14
+    movups xmm14, xmm0 ; 1.0 / width_f
+
+    movss xmm0, [rel one]
+    divss xmm0, xmm15
+    movups xmm15, xmm0 ; 1.0 / height_f
+
+    ; dx = 2.0 * inv_width * aspect_ratio * fov_scale
+    movss xmm0, xmm14
+    mulss xmm0, [rel two]
+    mulss xmm0, xmm12
+    mulss xmm0, [rel fov_scale]
+    movss [rsp + 8], xmm0
+
+    ; start_x = -1.0 * aspect_ratio * fov_scale
+    movss xmm1, [rel minus_one]
+    mulss xmm1, xmm12
+    mulss xmm1, [rel fov_scale]
+    movss [rsp + 12], xmm1
+
+    ; inv_height_scale = 2.0 * inv_height * fov_scale
+    movss xmm0, xmm15
+    mulss xmm0, [rel two]
+    mulss xmm0, [rel fov_scale]
+    movss [rsp + 16], xmm0
+
+    ; Precalculate sphere data for fast primary ray tracing
+    mov edx, [r15 + 504] ; num_spheres
+    mov [rsp + 72], rcx  ; save y_start
+    xor rcx, rcx
+    mov rsi, r15
+    movups xmm1, [r15 + 528] ; camera_pos
+
+.precalc_spheres:
+    cmp rcx, rdx
+    jge .precalc_done
+
+    ; r2 = radius * radius
+    movss xmm0, [rsi + 16]
+    mulss xmm0, xmm0
+    movss [rsp + 32 + rcx*4], xmm0
+
+    ; oc_primary = camera_pos - center
+    movups xmm2, xmm1
+    movups xmm0, [rsi + 0]
+    subps xmm2, xmm0
+    mov r11, rcx
+    shl r11, 4
+    movups [rsp + 128 + r11], xmm2
+
+    ; c_primary = dot(oc_primary, oc_primary) - r2
+    movups xmm3, xmm2
+    dpps xmm3, xmm2, 0x71
+    subss xmm3, [rsp + 32 + rcx*4]
+    movss [rsp + 80 + rcx*4], xmm3
+
+    add rsi, 48
+    inc rcx
+    jmp .precalc_spheres
+
+.precalc_done:
+    mov r8, [rsp + 72] ; y = y_start
 .loop_y:
-    cmp r8, [rsp + 32]
+    cmp r8, [rsp + 24]
     jge .done
+
+    ; Calculate row pointer rdi = pixels + (y * width) * 4
+    mov rdi, r8
+    imul rdi, r13
+    shl rdi, 2
+    add rdi, r12
+
+    ; Pre-calculate screen_y for row: fov_scale - y * inv_height_scale
+    cvtsi2ss xmm11, r8
+    mulss xmm11, [rsp + 16]
+    movss xmm0, [rel fov_scale]
+    subss xmm0, xmm11
+
+    ; Pre-calculate base_dir = screen_y * Up + Forward using SIMD in xmm12
+    shufps xmm0, xmm0, 0
+    movups xmm12, [r15 + 576] ; Up (Vector3)
+    mulps xmm12, xmm0
+    movups xmm0, [r15 + 544]  ; Forward (Vector3)
+    addps xmm12, xmm0         ; + Forward
+
+    ; Cache constant vectors for row loop
+    movups xmm14, [r15 + 560] ; Right (Vector3)
+    movups xmm15, [r15 + 480] ; plane_normal (Vector3)
+
+    ; Initialize screen_x accumulator in xmm13 = start_x
+    movss xmm13, [rsp + 12]
 
     xor r9, r9 ; x = 0
 .loop_x:
     cmp r9, r13
     jge .next_y
 
-    ; screen_y
-    cvtsi2ss xmm11, r8
-    divss xmm11, xmm15
-    mulss xmm11, [rel two]
-    subss xmm11, [rel one]
-    mulss xmm11, [rel minus_one]
-    mulss xmm11, [rel fov_scale]
+    ; Ray direction unnormalized: D_unnorm = screen_x * Right + base_dir
+    movups xmm0, xmm13
+    shufps xmm0, xmm0, 0
+    movups xmm3, xmm14       ; Right (cached in xmm14)
+    mulps xmm3, xmm0
+    addps xmm3, xmm12        ; + base_dir
 
-    ; screen_x
-    cvtsi2ss xmm0, r9
-    divss xmm0, xmm14
-    mulss xmm0, [rel two]
-    subss xmm0, [rel one]
-    mulss xmm0, xmm12 ; apply aspect ratio
-    mulss xmm0, [rel fov_scale] ; apply FOV
+    ; Normalize D_unnorm using SIMD dot product and rsqrtps with Newton-Raphson refinement
+    movups xmm0, xmm3
+    dpps xmm3, xmm3, 0x7F   ; len_sq broadcast to all components
+    rsqrtps xmm1, xmm3       ; initial approx 1/sqrt(len_sq)
+    movups xmm2, xmm1
+    mulps xmm2, xmm2         ; r^2
+    mulps xmm2, xmm3         ; r^2 * len_sq
+    movups xmm3, [rel three]
+    subps xmm3, xmm2         ; 3 - r^2 * len_sq
+    mulps xmm1, [rel half_vec]
+    mulps xmm1, xmm3         ; refined inv_len
+    mulps xmm0, xmm1         ; xmm0 = normalized D
 
-    ; Ray direction: D = normalize(screen_x*Right + screen_y*Up + Forward)
-    movss xmm3, xmm0
-    mulss xmm3, [r15 + 560] ; x * Right.x
-    movss xmm4, xmm11
-    mulss xmm4, [r15 + 576] ; y * Up.x
-    addss xmm3, xmm4
-    addss xmm3, [r15 + 544] ; Dir.x
-
-    movss xmm4, xmm0
-    mulss xmm4, [r15 + 564] ; x * Right.y
-    movss xmm5, xmm11
-    mulss xmm5, [r15 + 580] ; y * Up.y
-    addss xmm4, xmm5
-    addss xmm4, [r15 + 548] ; Dir.y
-
-    movss xmm5, xmm0
-    mulss xmm5, [r15 + 568] ; x * Right.z
-    movss xmm6, xmm11
-    mulss xmm6, [r15 + 584] ; y * Up.z
-    addss xmm5, xmm6
-    addss xmm5, [r15 + 552] ; Dir.z
-
-    ; Normalize Dir
-    movaps xmm0, xmm3
-    mulss xmm0, xmm0
-    movaps xmm1, xmm4
-    mulss xmm1, xmm1
-    addss xmm0, xmm1
-    movaps xmm1, xmm5
-    mulss xmm1, xmm1
-    addss xmm0, xmm1
-    sqrtss xmm0, xmm0
+    ; Ray Origin O in xmm1
+    movups xmm1, [r15 + 528] ; camera_pos (Vector3)
     
-    divss xmm3, xmm0
-    divss xmm4, xmm0
-    divss xmm5, xmm0
-
-    ; Setup Primary Ray
-    movss xmm0, [r15 + 528]
-    movss [rsp + 0], xmm0
-    movss xmm0, [r15 + 532]
-    movss [rsp + 4], xmm0
-    movss xmm0, [r15 + 536]
-    movss [rsp + 8], xmm0
-    
-    movss [rsp + 12], xmm3
-    movss [rsp + 16], xmm4
-    movss [rsp + 20], xmm5
-    
-    mov dword [rsp + 24], 1 ; allow 1 bounce
+    mov r10d, 1 ; allow 1 bounce
 
 .cast_ray:
-    movss xmm3, [rsp + 12]
-    movss xmm4, [rsp + 16]
-    movss xmm5, [rsp + 20]
-
     movss xmm7, [rel infinity]
-    mov r10, -1 ; -1: none, 0: sphere, 1: plane
-    mov r11, -1 ; hit_index
+    mov rax, -1 ; hit_type (-1: none, 0: sphere, 1: plane)
+    mov rbx, -1 ; hit_sphere_index
 
     ; 1. Plane Check
     cmp dword [r15 + 500], 0
     je .check_spheres
 
-    ; denom = dir . normal
-    movss xmm0, xmm3
-    mulss xmm0, [r15 + 480]
-    movss xmm1, xmm4
-    mulss xmm1, [r15 + 484]
-    addss xmm0, xmm1
-    movss xmm1, xmm5
-    mulss xmm1, [r15 + 488]
-    addss xmm0, xmm1
+    ; denom = dot(D, plane_normal)
+    movups xmm2, xmm0
+    dpps xmm2, xmm15, 0x71   ; plane_normal cached in xmm15
 
-    movaps xmm1, xmm0
-    andps xmm1, [rel abs_mask]
-    comiss xmm1, [rel eps]
+    movups xmm3, xmm2
+    andps xmm3, [rel abs_mask]
+    comiss xmm3, [rel eps]
     jb .check_spheres
 
-    ; t = -(origin . normal + dist) / denom
-    movss xmm1, [rsp + 0]
-    mulss xmm1, [r15 + 480]
-    movss xmm2, [rsp + 4]
-    mulss xmm2, [r15 + 484]
-    addss xmm1, xmm2
-    movss xmm2, [rsp + 8]
-    mulss xmm2, [r15 + 488]
-    addss xmm1, xmm2
-    addss xmm1, [r15 + 496]
-    mulss xmm1, [rel minus_one]
-    divss xmm1, xmm0
+    ; t_plane = -(dot(O, plane_normal) + plane_distance) / denom
+    movups xmm3, xmm1
+    dpps xmm3, xmm15, 0x71
+    addss xmm3, [r15 + 496]
+    xorps xmm3, [rel sign_bit]
+    divss xmm3, xmm2
 
-    comiss xmm1, [rel eps]
+    comiss xmm3, [rel eps]
     jbe .check_spheres
-    comiss xmm1, xmm7
+    comiss xmm3, xmm7
     jae .check_spheres
 
-    movaps xmm7, xmm1
-    mov r10, 1
+    movups xmm7, xmm3
+    mov rax, 1
 
 .check_spheres:
     xor rcx, rcx
-    mov eax, [r15 + 504]
+    mov edx, [r15 + 504]
+    mov rsi, r15
+
 .sphere_loop:
-    cmp rcx, rax
+    cmp rcx, rdx
     jge .after_spheres
 
-    imul rbx, rcx, 48
-    lea rbx, [r15 + rbx]
+    cmp r10d, 1
+    jne .sphere_secondary
 
-    ; oc = origin - center
-    movss xmm0, [rsp + 0]
-    subss xmm0, [rbx + 0]
-    movss xmm1, [rsp + 4]
-    subss xmm1, [rbx + 4]
-    movss xmm2, [rsp + 8]
-    subss xmm2, [rbx + 8]
+    ; --- Primary Ray Sphere Check ---
+    mov r11, rcx
+    shl r11, 4
+    movups xmm2, [rsp + 128 + r11] ; oc_primary
 
-    ; b = 2 * (dir . oc)
-    movaps xmm6, xmm3
-    mulss xmm6, xmm0
-    movaps xmm13, xmm4
-    mulss xmm13, xmm1
-    addss xmm6, xmm13
-    movaps xmm13, xmm5
-    mulss xmm13, xmm2
-    addss xmm6, xmm13
-    mulss xmm6, [rel two]
+    ; h = dot(D, oc_primary)
+    movups xmm3, xmm0
+    dpps xmm3, xmm2, 0x71
 
-    ; c = (oc . oc) - r^2
-    mulss xmm0, xmm0
-    mulss xmm1, xmm1
-    addss xmm0, xmm1
-    mulss xmm2, xmm2
-    addss xmm0, xmm2
-    movss xmm1, [rbx + 16]
-    mulss xmm1, xmm1
-    subss xmm0, xmm1
+    ; disc = h^2 - c_primary
+    movups xmm5, xmm3
+    mulss xmm5, xmm5
+    subss xmm5, [rsp + 80 + rcx*4]
+    jmp .check_disc
 
-    ; disc = b^2 - 4c
-    movaps xmm1, xmm6
-    mulss xmm1, xmm1
-    movaps xmm2, xmm0
-    mulss xmm2, [rel four]
-    subss xmm1, xmm2
+.sphere_secondary:
+    ; --- Secondary Ray Sphere Check ---
+    movups xmm2, xmm1
+    movups xmm4, [rsi + 0]
+    subps xmm2, xmm4
 
-    comiss xmm1, [rel zero]
+    ; h = dot(D, oc)
+    movups xmm3, xmm0
+    dpps xmm3, xmm2, 0x71
+
+    ; c = dot(oc, oc) - radius^2
+    movups xmm4, xmm2
+    dpps xmm4, xmm2, 0x71
+    subss xmm4, [rsp + 32 + rcx*4]
+
+    ; disc = h^2 - c
+    movups xmm5, xmm3
+    mulss xmm5, xmm5
+    subss xmm5, xmm4
+
+.check_disc:
+    comiss xmm5, [rel zero]
     jb .next_sphere
 
-    sqrtss xmm1, xmm1
-    movaps xmm2, xmm6
-    mulss xmm2, [rel minus_one]
-    subss xmm2, xmm1
-    divss xmm2, [rel two] ; t1
+    sqrtss xmm5, xmm5 ; sqrt_d
 
-    comiss xmm2, [rel eps]
+    ; t1 = -h - sqrt_d
+    movups xmm6, xmm3
+    addss xmm6, xmm5
+    xorps xmm6, [rel sign_bit]
+
+    comiss xmm6, [rel eps]
     ja .check_t_dist
 
-    ; Try t2 if t1 is behind (for refraction/inside out)
-    movaps xmm2, xmm6
-    mulss xmm2, [rel minus_one]
-    addss xmm2, xmm1
-    divss xmm2, [rel two] ; t2
+    ; t2 = sqrt_d - h
+    movups xmm6, xmm5
+    subss xmm6, xmm3
 
-    comiss xmm2, [rel eps]
+    comiss xmm6, [rel eps]
     jbe .next_sphere
 
 .check_t_dist:
-    comiss xmm2, xmm7
+    comiss xmm6, xmm7
     jae .next_sphere
 
-    movaps xmm7, xmm2
-    mov r10, 0
-    mov r11, rcx
+    movups xmm7, xmm6
+    mov rax, 0
+    mov rbx, rcx
 
 .next_sphere:
+    add rsi, 48
     inc rcx
     jmp .sphere_loop
 
 .after_spheres:
-    cmp r10, -1
+    cmp rax, -1
     je .no_hit
-    cmp r10, 1
+    cmp rax, 1
     je .plane_hit
 
     ; Sphere Hit
-    cmp dword [rsp + 24], 0
+    cmp r10d, 0
     je .sphere_dark
 
-    dec dword [rsp + 24]
+    dec r10d
     
-    imul rbx, r11, 48
-    lea rbx, [r15 + rbx]
+    imul rsi, rbx, 48
+    add rsi, r15
 
-    ; Hit Point P
-    movss xmm0, [rsp + 12]
-    mulss xmm0, xmm7
-    addss xmm0, [rsp + 0] ; P.x
-    movss xmm1, [rsp + 16]
-    mulss xmm1, xmm7
-    addss xmm1, [rsp + 4] ; P.y
-    movss xmm2, [rsp + 20]
-    mulss xmm2, xmm7
-    addss xmm2, [rsp + 8] ; P.z
+    ; Hit Point P = O + t_min * D
+    movups xmm8, xmm0
+    shufps xmm7, xmm7, 0
+    mulps xmm8, xmm7
+    addps xmm8, xmm1
 
-    ; Normal N in xmm8, xmm9, xmm10
-    movaps xmm8, xmm0
-    subss xmm8, [rbx + 0]
-    divss xmm8, [rbx + 16] ; N.x
-    movaps xmm9, xmm1
-    subss xmm9, [rbx + 4]
-    divss xmm9, [rbx + 16] ; N.y
-    movaps xmm10, xmm2
-    subss xmm10, [rbx + 8]
-    divss xmm10, [rbx + 16] ; N.z
+    ; Normal N = (P - center) / radius
+    movups xmm9, xmm8
+    movups xmm4, [rsi + 0]
+    subps xmm9, xmm4
+    movss xmm5, [rel one]
+    divss xmm5, [rsi + 16]
+    shufps xmm5, xmm5, 0
+    mulps xmm9, xmm5
 
-    ; dot(N, I) -> xmm11
-    movaps xmm11, xmm8
-    mulss xmm11, [rsp + 12]
-    movaps xmm13, xmm9
-    mulss xmm13, [rsp + 16]
-    addss xmm11, xmm13
-    movaps xmm13, xmm10
-    mulss xmm13, [rsp + 20]
-    addss xmm11, xmm13
-    
-    mulss xmm11, [rel two]
+    ; Reflection vector R = D - 2 * dot(N, D) * N
+    movups xmm10, xmm9
+    dpps xmm10, xmm0, 0x7F
+    addps xmm10, xmm10
+    mulps xmm10, xmm9
+    subps xmm0, xmm10 ; update D to R
 
-    ; R = I - 2*dot(N,I)*N
-    movaps xmm13, xmm8
-    mulss xmm13, xmm11
-    movss xmm3, [rsp + 12]
-    subss xmm3, xmm13 ; R.x
-    movss [rsp + 12], xmm3
-
-    movaps xmm13, xmm9
-    mulss xmm13, xmm11
-    movss xmm4, [rsp + 16]
-    subss xmm4, xmm13 ; R.y
-    movss [rsp + 16], xmm4
-
-    movaps xmm13, xmm10
-    mulss xmm13, xmm11
-    movss xmm5, [rsp + 20]
-    subss xmm5, xmm13 ; R.z
-    movss [rsp + 20], xmm5
-
-    ; Origin = P + N*eps
-    mulss xmm8, [rel eps_bounce]
-    addss xmm0, xmm8
-    movss [rsp + 0], xmm0
-
-    mulss xmm9, [rel eps_bounce]
-    addss xmm1, xmm9
-    movss [rsp + 4], xmm1
-
-    mulss xmm10, [rel eps_bounce]
-    addss xmm2, xmm10
-    movss [rsp + 8], xmm2
+    ; New Ray Origin O = P + N * eps_bounce
+    movups xmm1, xmm9
+    mulps xmm1, [rel eps_bounce_vec]
+    addps xmm1, xmm8 ; update O to new origin
 
     jmp .cast_ray
 
@@ -339,23 +328,20 @@ render_frame_part:
     jmp .write_color
 
 .plane_hit:
-    movss xmm0, [r15 + 480] ; normal.x
-    movss xmm1, [r15 + 484] ; normal.y
-    movss xmm2, [r15 + 488] ; normal.z
+    ; Hit point P = O + t_min * D
+    movaps xmm8, xmm0
+    shufps xmm7, xmm7, 0
+    mulps xmm8, xmm7
+    addps xmm8, xmm1
 
-    movss xmm13, xmm3
-    mulss xmm13, xmm7
-    addss xmm13, [rsp + 0] ; P.x
-    movss xmm9, xmm5
-    mulss xmm9, xmm7
-    addss xmm9, [rsp + 8] ; P.z
-
-    addss xmm13, [rel big_constant]
-    addss xmm9, [rel big_constant]
-    cvttss2si rax, xmm13
-    cvttss2si rbx, xmm9
-    add rax, rbx
-    and rax, 1
+    movss xmm5, xmm8 ; P.x
+    movhlps xmm6, xmm8 ; P.z
+    addss xmm5, [rel big_constant]
+    addss xmm6, [rel big_constant]
+    cvttss2si rcx, xmm5
+    cvttss2si rdx, xmm6
+    add rcx, rdx
+    and rcx, 1
     jz .white_sq
     movss xmm8, [rel check_gray]
     movss xmm10, [rel check_gray]
@@ -367,23 +353,17 @@ render_frame_part:
     movss xmm11, [rel one]
 
 .shade_plane:
-    movss xmm6, [rel light_dir_x]
-    mulss xmm6, xmm0
-    movss xmm13, [rel light_dir_y]
-    mulss xmm13, xmm1
-    addss xmm6, xmm13
-    movss xmm13, [rel light_dir_z]
-    mulss xmm13, xmm2
-    addss xmm6, xmm13
-    maxss xmm6, [rel zero]
-    addss xmm6, [rel ambient]
-    minss xmm6, [rel one]
+    movaps xmm5, [rel light_dir_vec]
+    dpps xmm5, xmm15, 0x71    ; plane_normal cached in xmm15
+    maxss xmm5, [rel zero]
+    addss xmm5, [rel ambient]
+    minss xmm5, [rel one]
 
-    mulss xmm8, xmm6
-    mulss xmm10, xmm6
-    mulss xmm11, xmm6
+    mulss xmm8, xmm5
+    mulss xmm10, xmm5
+    mulss xmm11, xmm5
     
-    cmp dword [rsp + 24], 0
+    cmp r10d, 0
     jne .write_color
     mulss xmm8, [rel tint_r]
     mulss xmm10, [rel tint_g]
@@ -394,7 +374,7 @@ render_frame_part:
     movss xmm8, [rel sky_r]
     movss xmm10, [rel sky_g]
     movss xmm11, [rel sky_b]
-    cmp dword [rsp + 24], 0
+    cmp r10d, 0
     jne .write_color
     mulss xmm8, [rel tint_r]
     mulss xmm10, [rel tint_g]
@@ -413,10 +393,11 @@ render_frame_part:
     or eax, edx
     or eax, 0xFF000000
 
-    mov r11, r8
-    imul r11, r13
-    add r11, r9
-    mov [r12 + r11 * 4], eax
+    mov [rdi], eax
+    add rdi, 4
+
+    ; Advance screen_x by dx
+    addss xmm13, [rsp + 8]
     inc r9
     jmp .loop_x
 
@@ -425,7 +406,7 @@ render_frame_part:
     jmp .loop_y
 
 .done:
-    add rsp, 40
+    add rsp, 312
     pop r15
     pop r14
     pop r13
@@ -437,16 +418,13 @@ render_frame_part:
 section .rodata
     one dd 1.0
     two dd 2.0
-    four dd 4.0
+    half dd 0.5
     minus_one dd -1.0
     zero dd 0.0
     infinity dd 1e30
     c255 dd 255.0
     ambient dd 0.2
     fov_scale dd 0.5
-    light_dir_x dd 0.577
-    light_dir_y dd 0.577
-    light_dir_z dd 0.577
     check_gray dd 0.7
     eps dd 1e-4
     eps_bounce dd 1e-2
@@ -458,6 +436,11 @@ section .rodata
     tint_g dd 0.4
     tint_b dd 0.4
     align 16
+    sign_bit dd 0x80000000, 0x0, 0x0, 0x0
     abs_mask dd 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF
+    eps_bounce_vec dd 1e-2, 1e-2, 1e-2, 0.0
+    three dd 3.0, 3.0, 3.0, 3.0
+    half_vec dd 0.5, 0.5, 0.5, 0.5
+    light_dir_vec dd 0.577, 0.577, 0.577, 0.0
 
 section .note.GNU-stack noalloc noexec nowrite progbits
